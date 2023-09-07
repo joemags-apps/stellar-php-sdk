@@ -9,12 +9,15 @@ namespace Soneso\StellarSDKTests;
 use Exception;
 use GuzzleHttp\Exception\GuzzleException;
 use PHPUnit\Framework\TestCase;
+use Soneso\StellarSDK\BumpFootprintExpirationOperationBuilder;
+use Soneso\StellarSDK\CreateContractHostFunction;
 use Soneso\StellarSDK\Crypto\KeyPair;
+use Soneso\StellarSDK\InvokeContractHostFunction;
 use Soneso\StellarSDK\InvokeHostFunctionOperationBuilder;
 use Soneso\StellarSDK\Network;
+use Soneso\StellarSDK\RestoreFootprintOperationBuilder;
 use Soneso\StellarSDK\Soroban\Address;
-use Soneso\StellarSDK\Soroban\AuthorizedInvocation;
-use Soneso\StellarSDK\Soroban\ContractAuth;
+use Soneso\StellarSDK\Soroban\SorobanAuthorizationEntry;
 use Soneso\StellarSDK\Soroban\Responses\GetHealthResponse;
 use Soneso\StellarSDK\Soroban\Responses\GetTransactionResponse;
 use Soneso\StellarSDK\Soroban\Responses\SendTransactionResponse;
@@ -22,179 +25,29 @@ use Soneso\StellarSDK\Soroban\SorobanServer;
 use Soneso\StellarSDK\StellarSDK;
 use Soneso\StellarSDK\Transaction;
 use Soneso\StellarSDK\TransactionBuilder;
+use Soneso\StellarSDK\UploadContractWasmHostFunction;
 use Soneso\StellarSDK\Util\FuturenetFriendBot;
+use Soneso\StellarSDK\Xdr\XdrContractEntryBodyType;
+use Soneso\StellarSDK\Xdr\XdrExtensionPoint;
+use Soneso\StellarSDK\Xdr\XdrLedgerEntryType;
+use Soneso\StellarSDK\Xdr\XdrLedgerFootprint;
+use Soneso\StellarSDK\Xdr\XdrLedgerKey;
+use Soneso\StellarSDK\Xdr\XdrLedgerKeyContractCode;
 use Soneso\StellarSDK\Xdr\XdrSCVal;
+use Soneso\StellarSDK\Xdr\XdrSorobanResources;
+use Soneso\StellarSDK\Xdr\XdrSorobanTransactionData;
+use Soneso\StellarSDK\Xdr\XdrTransactionMeta;
 
+// see: https://soroban.stellar.org/docs/fundamentals-and-concepts/authorization
+// see: https://soroban.stellar.org/docs/basic-tutorials/auth
 class SorobanAuthTest extends TestCase
 {
-
-    /**
-     * @throws GuzzleException
-     * @throws Exception
-     */
-    public function testAuthAccount(): void
-    {
-        $server = new SorobanServer("https://rpc-futurenet.stellar.org:443");
-        $server->enableLogging = true;
-        $server->acknowledgeExperimental = true;
-        $sdk = StellarSDK::getFutureNetInstance();
-
-        $submitterKeyPair = KeyPair::random();
-        $submitterId = $submitterKeyPair->getAccountId();
-        $invokerKeyPair = KeyPair::random();
-        $invokerId = $invokerKeyPair->getAccountId();
-
-        // get health
-        $getHealthResponse = $server->getHealth();
-        $this->assertEquals(GetHealthResponse::HEALTHY, $getHealthResponse->status);
-
-        FuturenetFriendBot::fundTestAccount($submitterId);
-        FuturenetFriendBot::fundTestAccount($invokerId);
-        sleep(5);
-
-        $getAccountResponse = $sdk->requestAccount($submitterId);
-        $this->assertEquals($submitterId, $getAccountResponse->getAccountId());
-
-        // install contract
-        $contractCode = file_get_contents('./wasm/auth.wasm', false);
-        $installContractOp = InvokeHostFunctionOperationBuilder::
-        forInstallingContractCode($contractCode)->build();
-
-        $transaction = (new TransactionBuilder($getAccountResponse))
-            ->addOperation($installContractOp)->build();
-
-        // simulate first to get the footprint
-        $simulateResponse = $server->simulateTransaction($transaction);
-
-        $this->assertNull($simulateResponse->error);
-        $this->assertNull($simulateResponse->resultError);
-
-        // set the footprint and sign
-        $transaction->setFootprint($simulateResponse->getFootprint());
-        $transaction->sign($submitterKeyPair, Network::futurenet());
-
-        // check transaction xdr encoding back and forth
-        $transctionEnvelopeXdr = $transaction->toEnvelopeXdrBase64();
-        $this->assertEquals($transctionEnvelopeXdr,
-            Transaction::fromEnvelopeBase64XdrString($transctionEnvelopeXdr)->toEnvelopeXdrBase64());
-
-        // send the transaction
-        $sendResponse = $server->sendTransaction($transaction);
-        $this->assertNull($sendResponse->error);
-        $this->assertNotEquals(SendTransactionResponse::STATUS_ERROR, $sendResponse->status);
-
-        // poll until status is success or error
-        $statusResponse = $this->pollStatus($server, $sendResponse->hash);
-        $this->assertNotNull($statusResponse);
-        $wasmId = $statusResponse->getWasmId();
-        $this->assertNotNull($wasmId);
-
-
-        // create contract
-        $createContractOp = InvokeHostFunctionOperationBuilder::forCreatingContract($wasmId)->build();
-        $submitterAccount = $sdk->requestAccount($submitterId);
-
-        $transaction = (new TransactionBuilder($submitterAccount))
-            ->addOperation($createContractOp)->build();
-
-        // simulate first to get the footprint
-        $simulateResponse = $server->simulateTransaction($transaction);
-
-        $this->assertNull($simulateResponse->error);
-        $this->assertNotNull($simulateResponse->results);
-        $this->assertNotNull($simulateResponse->getFootprint());
-
-        // set the footprint and sign
-        $transaction->setFootprint($simulateResponse->getFootprint());
-        $transaction->sign($submitterKeyPair, Network::futurenet());
-
-        // send the transaction
-        $sendResponse = $server->sendTransaction($transaction);
-        $this->assertNull($sendResponse->error);
-        $this->assertNotEquals(SendTransactionResponse::STATUS_ERROR, $sendResponse->status);
-
-        // poll until status is success or error
-        $statusResponse = $this->pollStatus($server, $sendResponse->hash);
-        $this->assertNotNull($statusResponse);
-        $contractId = $statusResponse->getContractId();
-        $this->assertNotNull($contractId);
-
-        // invoke contract
-        // # If tx_submitter_kp and op_invoker_kp use the same account, the submission will fail
-        // because in that case we do not need address, nonce and signature in auth or we have to change the footprint
-        // See https://discord.com/channels/897514728459468821/1078208197283807305
-
-        $invokerAddress = Address::fromAccountId($invokerId);
-        $nonce = $server->getNonce($invokerId, $contractId);
-
-        $functionName = "auth";
-        $args = [$invokerAddress->toXdrSCVal(), XdrSCVal::forU32(3)];
-
-        $authInvocation = new AuthorizedInvocation($contractId, $functionName, args: $args);
-
-        $contractAuth = new ContractAuth($authInvocation, address: $invokerAddress, nonce: $nonce);
-        $contractAuth->sign($invokerKeyPair, Network::futurenet());
-
-        $invokeOp = InvokeHostFunctionOperationBuilder::forInvokingContract($contractId,
-            $functionName, $args, auth: [$contractAuth])->build();
-
-        // simulate first to obtain the footprint
-        $submitterAccount = $sdk->requestAccount($submitterId);
-        $transaction = (new TransactionBuilder($submitterAccount))
-            ->addOperation($invokeOp)->build();
-
-        $simulateResponse = $server->simulateTransaction($transaction);
-
-        $this->assertNull($simulateResponse->error);
-        $this->assertNotNull($simulateResponse->results);
-
-        $authResult = $simulateResponse->getAuth();
-        $this->assertNotNull($authResult);
-        $this->assertCount(1, $authResult);
-
-        // set the footprint and sign
-        $transaction->setFootprint($simulateResponse->getFootprint());
-        $transaction->sign($submitterKeyPair, Network::futurenet());
-
-        // check transaction xdr encoding back and forth
-        $transctionEnvelopeXdr = $transaction->toEnvelopeXdrBase64();
-        $this->assertEquals($transctionEnvelopeXdr, Transaction::fromEnvelopeBase64XdrString($transctionEnvelopeXdr)->toEnvelopeXdrBase64());
-
-        // send the transaction
-        $sendResponse = $server->sendTransaction($transaction);
-        $this->assertNull($sendResponse->error);
-        $this->assertNotEquals(SendTransactionResponse::STATUS_ERROR, $sendResponse->status);
-
-        // poll until status is success or error
-        $statusResponse = $this->pollStatus($server, $sendResponse->hash);
-        $this->assertNotNull($statusResponse);
-        $this->assertNotNull($statusResponse->getResultValue());
-
-
-        // user friendly
-        $resVal = $statusResponse->getResultValue();
-        $map = $resVal->getMap();
-        if ($map != null && count($map) > 0) {
-            foreach ($map as $entry) {
-                print("{" . $entry->key->address->accountId->getAccountId() . ", " . strval($entry->val->u32) . "}".PHP_EOL);
-            }
-        }
-
-        // check horizon response decoding.
-        $transactionResponse = $sdk->requestTransaction($sendResponse->hash);
-        $this->assertEquals(1, $transactionResponse->getOperationCount());
-        $this->assertEquals($transctionEnvelopeXdr, $transactionResponse->getEnvelopeXdr()->toBase64Xdr());
-        $meta = $transactionResponse->getResultMetaXdrBase64();
-
-        // parsing meta is working
-        //$metaXdr = XdrTransactionMeta::fromBase64Xdr($meta);
-        //$this->assertEquals($meta, $metaXdr->toBase64Xdr());
-
-    }
+    const AUTH_CONTRACT_PATH = './wasm/soroban_auth_contract.wasm';
 
     public function testAuthInvoker(): void
     {
-        // see https://soroban.stellar.org/docs/learn/authorization#transaction-invoker
+        // submitter and invoker use are the same
+        // no need to sign auth
 
         $server = new SorobanServer("https://rpc-futurenet.stellar.org:443");
         $server->enableLogging = true;
@@ -209,108 +62,43 @@ class SorobanAuthTest extends TestCase
         $this->assertEquals(GetHealthResponse::HEALTHY, $getHealthResponse->status);
 
         FuturenetFriendBot::fundTestAccount($invokerId);
-        sleep(5);
 
-        $getAccountResponse = $sdk->requestAccount($invokerId);
-        $this->assertEquals($invokerId, $getAccountResponse->getAccountId());
+        $contractId = $this->deployContract($server, self::AUTH_CONTRACT_PATH, $invokerKeyPair);
 
-        // install contract
-        $contractCode = file_get_contents('./wasm/auth.wasm', false);
-        $installContractOp = InvokeHostFunctionOperationBuilder::
-        forInstallingContractCode($contractCode)->build();
+        // submitter and invoker use are the same
+        // no need to sign auth
 
-        $transaction = (new TransactionBuilder($getAccountResponse))
-            ->addOperation($installContractOp)->build();
-
-        // simulate first to get the footprint
-        $simulateResponse = $server->simulateTransaction($transaction);
-
-        $this->assertNull($simulateResponse->error);
-        $this->assertNull($simulateResponse->resultError);
-
-        // set the footprint and sign
-        $transaction->setFootprint($simulateResponse->getFootprint());
-        $transaction->sign($invokerKeyPair, Network::futurenet());
-
-        // check transaction xdr encoding back and forth
-        $transctionEnvelopeXdr = $transaction->toEnvelopeXdrBase64();
-        $this->assertEquals($transctionEnvelopeXdr,
-            Transaction::fromEnvelopeBase64XdrString($transctionEnvelopeXdr)->toEnvelopeXdrBase64());
-
-        // send the transaction
-        $sendResponse = $server->sendTransaction($transaction);
-        $this->assertNull($sendResponse->error);
-        $this->assertNotEquals(SendTransactionResponse::STATUS_ERROR, $sendResponse->status);
-
-        // poll until status is success or error
-        $statusResponse = $this->pollStatus($server, $sendResponse->hash);
-        $this->assertNotNull($statusResponse);
-        $wasmId = $statusResponse->getWasmId();
-        $this->assertNotNull($wasmId);
-
-
-        // create contract
-        $createContractOp = InvokeHostFunctionOperationBuilder::forCreatingContract($wasmId)->build();
-        $invokerAccount = $sdk->requestAccount($invokerId);
-
-        $transaction = (new TransactionBuilder($invokerAccount))
-            ->addOperation($createContractOp)->build();
-
-        // simulate first to get the footprint
-        $simulateResponse = $server->simulateTransaction($transaction);
-
-        $this->assertNull($simulateResponse->error);
-        $this->assertNotNull($simulateResponse->results);
-        $this->assertNotNull($simulateResponse->getFootprint());
-
-        // set the footprint and sign
-        $transaction->setFootprint($simulateResponse->getFootprint());
-        $transaction->sign($invokerKeyPair, Network::futurenet());
-
-        // send the transaction
-        $sendResponse = $server->sendTransaction($transaction);
-        $this->assertNull($sendResponse->error);
-        $this->assertNotEquals(SendTransactionResponse::STATUS_ERROR, $sendResponse->status);
-
-        // poll until status is success or error
-        $statusResponse = $this->pollStatus($server, $sendResponse->hash);
-        $this->assertNotNull($statusResponse);
-        $contractId = $statusResponse->getContractId();
-        $this->assertNotNull($contractId);
-
-        // invoke contract no auth needed
-        // # If tx_submitter_kp and op_invoker_kp use are the same
-        // so we should not need its address & nonce in contract auth and no need to sign
-        // see https://discord.com/channels/897514728459468821/1078208197283807305
-        // see https://soroban.stellar.org/docs/learn/authorization#transaction-invoker
-
-        $functionName = "auth";
+        $functionName = "increment";
 
         $invokerAddress = new Address(Address::TYPE_ACCOUNT, accountId: $invokerId);
         $args = [$invokerAddress->toXdrSCVal(), XdrSCVal::forU32(3)];
 
-        // we still need contract auth but we do not need to add the account and sign
-        $authInvocation = new AuthorizedInvocation($contractId, $functionName, args: $args);
-        $contractAuth = new ContractAuth($authInvocation);
+        // simulate first to get the transaction data and resource fee
+        $invokeHostFunction = new InvokeContractHostFunction($contractId, $functionName, $args);
+        $builder = new InvokeHostFunctionOperationBuilder($invokeHostFunction);
+        $op = $builder->build();
 
-        $invokeContractOp = InvokeHostFunctionOperationBuilder::forInvokingContract($contractId, $functionName, $args, auth: [$contractAuth])->build();
-
-        // simulate first to obtain the footprint
+        sleep(5);
         $invokerAccount = $sdk->requestAccount($invokerId);
         $transaction = (new TransactionBuilder($invokerAccount))
-            ->addOperation($invokeContractOp)->build();
+            ->addOperation($op)->build();
 
-        // simulate first to get the footprint
         $simulateResponse = $server->simulateTransaction($transaction);
 
         $this->assertNull($simulateResponse->error);
+        $this->assertNull($simulateResponse->resultError);
         $this->assertNotNull($simulateResponse->results);
+        $this->assertNotNull($simulateResponse->transactionData);
+        $this->assertNotNull($simulateResponse->minResourceFee);
 
-        $authResult = $simulateResponse->getAuth();
-        $this->assertNotNull($authResult);
 
-        // set the footprint and sign
-        $transaction->setFootprint($simulateResponse->getFootprint());
+        $transactionData = $simulateResponse->getTransactionData();
+
+        // set the transaction data + fee and sign
+        $transaction->setSorobanTransactionData($transactionData);
+        $transaction->addResourceFee($simulateResponse->minResourceFee);
+        $transaction->setSorobanAuth($simulateResponse->getSorobanAuth());
+        // sign auth
         $transaction->sign($invokerKeyPair, Network::futurenet());
 
         // check transaction xdr encoding back and forth
@@ -326,7 +114,6 @@ class SorobanAuthTest extends TestCase
         $statusResponse = $this->pollStatus($server, $sendResponse->hash);
         $this->assertNotNull($statusResponse);
         $this->assertNotNull($statusResponse->getResultValue());
-
 
         // user friendly
         $resVal = $statusResponse->getResultValue();
@@ -345,10 +132,131 @@ class SorobanAuthTest extends TestCase
         $meta = $transactionResponse->getResultMetaXdrBase64();
 
         // parsing meta is working
-        //$metaXdr = XdrTransactionMeta::fromBase64Xdr($meta);
+        $metaXdr = XdrTransactionMeta::fromBase64Xdr($meta);
         //$this->assertEquals($meta, $metaXdr->toBase64Xdr());
 
     }
+
+    /**
+     * @throws GuzzleException
+     * @throws Exception
+     */
+    public function testAuthDifferentSubmitter(): void
+    {
+
+        // submitter and invoker use are NOT the same
+        // we need to sign auth
+
+        $server = new SorobanServer("https://rpc-futurenet.stellar.org:443");
+        $server->enableLogging = true;
+        $server->acknowledgeExperimental = true;
+        $sdk = StellarSDK::getFutureNetInstance();
+
+        $submitterKeyPair = KeyPair::random();
+        $submitterId = $submitterKeyPair->getAccountId();
+        $invokerKeyPair = KeyPair::random();
+        $invokerId = $invokerKeyPair->getAccountId();
+
+        FuturenetFriendBot::fundTestAccount($submitterId);
+        FuturenetFriendBot::fundTestAccount($invokerId);
+
+        $contractId = $this->deployContract($server, self::AUTH_CONTRACT_PATH, $submitterKeyPair);
+
+        // invoke contract
+        // submitter and invoker use are NOT the same
+        // we need to sign auth
+
+        $invokerAddress = Address::fromAccountId($invokerId);
+
+        $functionName = "increment";
+        $args = [$invokerAddress->toXdrSCVal(), XdrSCVal::forU32(3)];
+
+        // simulate first to get the transaction data and resource fee + auth
+
+        $invokeHostFunction = new InvokeContractHostFunction($contractId, $functionName, $args);
+        $builder = new InvokeHostFunctionOperationBuilder($invokeHostFunction);
+        $op = $builder->build();
+
+        $submitterAccount = $sdk->requestAccount($submitterId);
+        $transaction = (new TransactionBuilder($submitterAccount))
+            ->addOperation($op)->build();
+
+        $simulateResponse = $server->simulateTransaction($transaction);
+
+        $this->assertNull($simulateResponse->error);
+        $this->assertNull($simulateResponse->resultError);
+        $this->assertNotNull($simulateResponse->results);
+        $this->assertNotNull($simulateResponse->transactionData);
+        $this->assertNotNull($simulateResponse->minResourceFee);
+
+
+        // this is because in preview 9 the fee calculation from the simulation is not always accurate
+        // see: https://discord.com/channels/897514728459468821/1112853306881081354
+        $transactionData = $simulateResponse->getTransactionData();
+        $transactionData->resources->instructions += intval($transactionData->resources->instructions / 4);
+        $simulateResponse->minResourceFee += 6000;
+
+        // set the transaction data + fee and sign
+        $transaction->setSorobanTransactionData($transactionData);
+        $transaction->addResourceFee($simulateResponse->minResourceFee);
+
+        // submitter and invoker use are NOT the same
+        // we need to sign auth
+
+        $auth = $simulateResponse->getSorobanAuth();
+        $this->assertNotNull($auth);
+
+        $latestLedgerResponse = $server->getLatestLedger();
+        $this->assertNotNull($latestLedgerResponse->sequence);
+        foreach ($auth as $a) {
+            if ($a instanceof  SorobanAuthorizationEntry) {
+                $this->assertNotNull($a->credentials->addressCredentials);
+                // increase signature expiration ledger
+                $a->credentials->addressCredentials->signatureExpirationLedger = $latestLedgerResponse->sequence + 10;
+                // sign
+                $a->sign($invokerKeyPair, Network::futurenet());
+            } else {
+                self::fail("invalid auth");
+            }
+        }
+        $transaction->setSorobanAuth($auth);
+        $transaction->sign($submitterKeyPair, Network::futurenet());
+
+        // check transaction xdr encoding back and forth
+        $transctionEnvelopeXdr = $transaction->toEnvelopeXdrBase64();
+        $this->assertEquals($transctionEnvelopeXdr, Transaction::fromEnvelopeBase64XdrString($transctionEnvelopeXdr)->toEnvelopeXdrBase64());
+
+        // send the transaction
+        $sendResponse = $server->sendTransaction($transaction);
+        $this->assertNull($sendResponse->error);
+        $this->assertNotEquals(SendTransactionResponse::STATUS_ERROR, $sendResponse->status);
+
+        // poll until status is success or error
+        $statusResponse = $this->pollStatus($server, $sendResponse->hash);
+        $this->assertNotNull($statusResponse);
+        $this->assertNotNull($statusResponse->getResultValue());
+
+        // user friendly
+        $resVal = $statusResponse->getResultValue();
+        $map = $resVal->getMap();
+        if ($map != null && count($map) > 0) {
+            foreach ($map as $entry) {
+                print("{" . $entry->key->address->accountId->getAccountId() . ", " . strval($entry->val->u32) . "}".PHP_EOL);
+            }
+        }
+
+        sleep(5);
+        // check horizon response decoding.
+        $transactionResponse = $sdk->requestTransaction($sendResponse->hash);
+        $this->assertEquals(1, $transactionResponse->getOperationCount());
+        $this->assertEquals($transctionEnvelopeXdr, $transactionResponse->getEnvelopeXdr()->toBase64Xdr());
+        $meta = $transactionResponse->getResultMetaXdrBase64();
+
+        // parsing meta is working
+        $metaXdr = XdrTransactionMeta::fromBase64Xdr($meta);
+        //$this->assertEquals($meta, $metaXdr->toBase64Xdr());
+    }
+
 
     private function pollStatus(SorobanServer $server, string $transactionId) : ?GetTransactionResponse {
         $statusResponse = null;
@@ -367,6 +275,191 @@ class SorobanAuthTest extends TestCase
             }
         }
         return $statusResponse;
+    }
+
+    private function restoreContractFootprint(SorobanServer $server, KeyPair $accountKeyPair, string $contractCodePath) : void {
+        sleep(5);
+        $sdk = StellarSDK::getFutureNetInstance();
+
+        $contractCode = file_get_contents($contractCodePath, false);
+        $uploadContractHostFunction = new UploadContractWasmHostFunction($contractCode);
+        $op = (new InvokeHostFunctionOperationBuilder($uploadContractHostFunction))->build();
+
+        $accountAId = $accountKeyPair->getAccountId();
+        $getAccountResponse = $sdk->requestAccount($accountAId);
+        $transaction = (new TransactionBuilder($getAccountResponse))
+            ->addOperation($op)->build();
+
+        $simulateResponse = $server->simulateTransaction($transaction);
+
+        $this->assertNull($simulateResponse->error);
+        $this->assertNull($simulateResponse->resultError);
+        $this->assertNotNull($simulateResponse->results);
+        $this->assertNotNull($simulateResponse->getTransactionData());
+
+        $transactionData = $simulateResponse->getTransactionData();
+        $transactionData->resources->footprint->readWrite = $transactionData->resources->footprint->readWrite + $transactionData->resources->footprint->readOnly;
+        $transactionData->resources->footprint->readOnly = array();
+
+        $getAccountResponse = $sdk->requestAccount($accountAId);
+        $restoreOp = (new RestoreFootprintOperationBuilder())->build();
+        $transaction = (new TransactionBuilder($getAccountResponse))
+            ->addOperation($restoreOp)->build();
+
+        $transaction->setSorobanTransactionData($transactionData) ;
+        $simulateResponse = $server->simulateTransaction($transaction);
+
+        $this->assertNull($simulateResponse->error);
+        $this->assertNull($simulateResponse->resultError);
+        $this->assertNotNull($simulateResponse->results);
+        $this->assertNotNull($simulateResponse->getTransactionData());
+        $this->assertNotNull($simulateResponse->getMinResourceFee());
+
+        // set the transaction data + fee and sign
+        $transaction->setSorobanTransactionData($simulateResponse->getTransactionData());
+        $transaction->addResourceFee($simulateResponse->getMinResourceFee());
+        $transaction->sign($accountKeyPair, Network::futurenet());
+
+        // check transaction xdr encoding back and forth
+        $transctionEnvelopeXdr = $transaction->toEnvelopeXdrBase64();
+        $this->assertEquals($transctionEnvelopeXdr,
+            Transaction::fromEnvelopeBase64XdrString($transctionEnvelopeXdr)->toEnvelopeXdrBase64());
+
+        // send the transaction
+        $sendResponse = $server->sendTransaction($transaction);
+        $this->assertNull($sendResponse->error);
+        $this->assertNotNull($sendResponse->hash);
+        $this->assertNotNull($sendResponse->status);
+        $this->assertNotEquals(SendTransactionResponse::STATUS_ERROR, $sendResponse->status);
+
+        // poll until status is success or error
+        $statusResponse = $this->pollStatus($server, $sendResponse->hash);
+        $this->assertNotNull($statusResponse);
+        $this->assertEquals(GetTransactionResponse::STATUS_SUCCESS, $statusResponse->status);
+    }
+
+    private function bumpContractCodeFootprint(SorobanServer $server, KeyPair $accountKeyPair, string $wasmId, int $ledgersToExpire) : void {
+        sleep(5);
+        $sdk = StellarSDK::getFutureNetInstance();
+
+        $builder = new BumpFootprintExpirationOperationBuilder($ledgersToExpire);
+        $bumpOp = $builder->build();
+
+        $accountAId = $accountKeyPair->getAccountId();
+        $getAccountResponse = $sdk->requestAccount($accountAId);
+        $transaction = (new TransactionBuilder($getAccountResponse))
+            ->addOperation($bumpOp)->build();
+
+        $readOnly = array();
+        $readWrite = array();
+        $codeKey = new XdrLedgerKey(XdrLedgerEntryType::CONTRACT_CODE());
+        $codeKey->contractCode = new XdrLedgerKeyContractCode(hex2bin($wasmId), XdrContractEntryBodyType::DATA_ENTRY());
+        array_push($readOnly, $codeKey);
+
+        $footprint = new XdrLedgerFootprint($readOnly, $readWrite);
+        $resources = new XdrSorobanResources($footprint, 0,0,0,0);
+        $transactionData = new XdrSorobanTransactionData(new XdrExtensionPoint(0), $resources, 0);
+
+        $transaction->setSorobanTransactionData($transactionData) ;
+        $simulateResponse = $server->simulateTransaction($transaction);
+
+        $this->assertNull($simulateResponse->error);
+        $this->assertNull($simulateResponse->resultError);
+        $this->assertNotNull($simulateResponse->results);
+        $this->assertNotNull($simulateResponse->getTransactionData());
+        $this->assertNotNull($simulateResponse->getMinResourceFee());
+
+        // set the transaction data + fee and sign
+        $transaction->setSorobanTransactionData($simulateResponse->getTransactionData());
+        $transaction->addResourceFee($simulateResponse->getMinResourceFee());
+        $transaction->sign($accountKeyPair, Network::futurenet());
+
+        // check transaction xdr encoding back and forth
+        $transctionEnvelopeXdr = $transaction->toEnvelopeXdrBase64();
+        $this->assertEquals($transctionEnvelopeXdr,
+            Transaction::fromEnvelopeBase64XdrString($transctionEnvelopeXdr)->toEnvelopeXdrBase64());
+
+        // send the transaction
+        $sendResponse = $server->sendTransaction($transaction);
+        $this->assertNull($sendResponse->error);
+        $this->assertNotNull($sendResponse->hash);
+        $this->assertNotNull($sendResponse->status);
+        $this->assertNotEquals(SendTransactionResponse::STATUS_ERROR, $sendResponse->status);
+
+        // poll until status is success or error
+        $statusResponse = $this->pollStatus($server, $sendResponse->hash);
+        $this->assertNotNull($statusResponse);
+        $this->assertEquals(GetTransactionResponse::STATUS_SUCCESS, $statusResponse->status);
+    }
+
+    private function deployContract(SorobanServer $server, String $pathToCode, KeyPair $submitterKp) : String {
+        sleep(5);
+        $sdk = StellarSDK::getFutureNetInstance();
+
+        $this->restoreContractFootprint($server, $submitterKp, $pathToCode);
+
+        // upload contract wasm
+        $contractCode = file_get_contents($pathToCode, false);
+
+        $uploadContractHostFunction = new UploadContractWasmHostFunction($contractCode);
+        $builder = new InvokeHostFunctionOperationBuilder($uploadContractHostFunction);
+        $op = $builder->build();
+
+        sleep(5);
+        $submitterId = $submitterKp->getAccountId();
+        $account = $sdk->requestAccount($submitterId);
+        $transaction = (new TransactionBuilder($account))->addOperation($op)->build();
+
+        // simulate first to get the transaction data and resource fee
+        $simulateResponse = $server->simulateTransaction($transaction);
+
+
+        // set the transaction data + fee and sign
+        $transaction->setSorobanTransactionData($simulateResponse->getTransactionData());
+        $transaction->addResourceFee($simulateResponse->minResourceFee);
+        $transaction->sign($submitterKp, Network::futurenet());
+
+        // send the transaction
+        $sendResponse = $server->sendTransaction($transaction);
+        $this->assertNotEquals(SendTransactionResponse::STATUS_ERROR, $sendResponse->status);
+
+        // poll until status is success or error
+        $statusResponse = $this->pollStatus($server, $sendResponse->hash);
+        $this->assertNotNull($statusResponse);
+        $wasmId = $statusResponse->getWasmId();
+        $this->assertNotNull($wasmId);
+
+        $this->bumpContractCodeFootprint($server, $submitterKp, $wasmId, 100000);
+
+        // create contract
+        $createContractHostFunction = new CreateContractHostFunction(Address::fromAccountId($submitterId), $wasmId);
+        $builder = new InvokeHostFunctionOperationBuilder($createContractHostFunction);
+        $op = $builder->build();
+
+        sleep(5);
+        $account = $sdk->requestAccount($submitterId);
+        $transaction = (new TransactionBuilder($account))
+            ->addOperation($op)->build();
+
+        // simulate first to get the transaction data and resource fee
+        $simulateResponse = $server->simulateTransaction($transaction);
+
+        // set the transaction data + fee and sign
+        $transaction->setSorobanTransactionData($simulateResponse->getTransactionData());
+        $transaction->addResourceFee($simulateResponse->minResourceFee);
+        $transaction->setSorobanAuth($simulateResponse->getSorobanAuth());
+        $transaction->sign($submitterKp, Network::futurenet());
+
+        // send the transaction
+        $sendResponse = $server->sendTransaction($transaction);
+        $this->assertNotEquals(SendTransactionResponse::STATUS_ERROR, $sendResponse->status);
+
+        // poll until status is success or error
+        $statusResponse = $this->pollStatus($server, $sendResponse->hash);
+        $this->assertNotNull($statusResponse);
+        $contractId = $statusResponse->getCreatedContractId();
+        $this->assertNotNull($contractId);
+        return $contractId;
     }
 
 }

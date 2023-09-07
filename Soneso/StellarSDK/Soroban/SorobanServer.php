@@ -12,7 +12,6 @@ use GuzzleHttp\Psr7\Request;
 use Psr\Http\Message\ResponseInterface;
 use Soneso\StellarSDK\Requests\RequestBuilder;
 use Soneso\StellarSDK\Soroban\Requests\GetEventsRequest;
-use Soneso\StellarSDK\Soroban\Responses\GetAccountResponse;
 use Soneso\StellarSDK\Soroban\Responses\GetEventsResponse;
 use Soneso\StellarSDK\Soroban\Responses\GetHealthResponse;
 use Soneso\StellarSDK\Soroban\Responses\GetLatestLedgerResponse;
@@ -23,9 +22,15 @@ use Soneso\StellarSDK\Soroban\Responses\SendTransactionResponse;
 use Soneso\StellarSDK\Soroban\Responses\SimulateTransactionResponse;
 use Soneso\StellarSDK\Soroban\Responses\SorobanRpcResponse;
 use Soneso\StellarSDK\Transaction;
+use Soneso\StellarSDK\Xdr\XdrContractCodeEntry;
+use Soneso\StellarSDK\Xdr\XdrContractDataDurability;
+use Soneso\StellarSDK\Xdr\XdrContractEntryBodyType;
+use Soneso\StellarSDK\Xdr\XdrLedgerEntryData;
 use Soneso\StellarSDK\Xdr\XdrLedgerEntryType;
 use Soneso\StellarSDK\Xdr\XdrLedgerKey;
-use Soneso\StellarSDK\Xdr\XdrSCNonceKey;
+use Soneso\StellarSDK\Xdr\XdrLedgerKeyContractCode;
+use Soneso\StellarSDK\Xdr\XdrLedgerKeyContractData;
+use Soneso\StellarSDK\Xdr\XdrSCAddress;
 use Soneso\StellarSDK\Xdr\XdrSCVal;
 
 /// This class helps you to connect to a local or remote soroban rpc server
@@ -39,7 +44,6 @@ class SorobanServer
 
     private const GET_HEALTH = "getHealth";
     private const GET_NETWORK = "getNetwork";
-    private const GET_ACCOUNT = "getAccount";
     private const SIMULATE_TRANSACTION = "simulateTransaction";
     private const SEND_TRANSACTION = "sendTransaction";
     private const GET_TRANSACTION = "getTransaction";
@@ -97,17 +101,6 @@ class SorobanServer
         return $this->request($body, self::GET_NETWORK);
     }
 
-    /* // This has been removed from the rpc api.
-        // one can use $account = $sdk->requestAccount($accountId); instead.
-        public function getAccount(string $accountId) : GetAccountResponse {
-            if (!$this->acknowledgeExperimental) {
-                $this->printExperimentalFlagErr();
-                return GetAccountResponse::fromJson($this->experimentErr);
-            }
-            $body = $this->prepareRequest(self::GET_ACCOUNT, [$accountId]);
-            return $this->request($body, self::GET_ACCOUNT);
-        }
-    */
     /**
      * Submit a trial contract invocation to get back return values, expected ledger footprint, and expected costs.
      * @param Transaction $transaction to submit.
@@ -193,33 +186,45 @@ class SorobanServer
     }
 
     /**
-     * Loads nonce from ledger entry if available, otherwise returns 0
-     * @param string $accountId the account Id to load the nonce for.
-     * @param string $contractId the contract Id to load the nonce for.
-     * @return int the nonce if found otherwise 0.
+     * Loads the contract source code (including source code - wasm bytes) for a given wasm id.
+     * @param string $wasmId
+     * @return XdrContractCodeEntry|null The contract code entry if found
      * @throws GuzzleException
      */
-    public function getNonce(string $accountId, string $contractId) : int {
+    public function loadContractCodeForWasmId(string $wasmId) : ?XdrContractCodeEntry {
+        $ledgerKey = new XdrLedgerKey(XdrLedgerEntryType::CONTRACT_CODE());
+        $ledgerKey->contractCode = new XdrLedgerKeyContractCode(hex2bin($wasmId), XdrContractEntryBodyType::DATA_ENTRY());
+        $ledgerEntry = $this->getLedgerEntry($ledgerKey->toBase64Xdr());
+        if ($ledgerEntry != null && $ledgerEntry->ledgerEntryData != null) {
+            $ledgerEntryData = XdrLedgerEntryData::fromBase64Xdr($ledgerEntry->ledgerEntryData);
+            return $ledgerEntryData->contractCode;
+        }
+        return null;
+    }
 
+    /**
+     * Loads the contract code entry (including source code - wasm bytes) for a given contract id.
+     * @param string $contractId
+     * @return XdrContractCodeEntry|null The contract code entry if found
+     * @throws GuzzleException
+     */
+    public function loadContractCodeForContractId(string $contractId) : ?XdrContractCodeEntry {
         $ledgerKey = new XdrLedgerKey(XdrLedgerEntryType::CONTRACT_DATA());
-        $ledgerKey->contractID = $contractId;
-        $address = new Address(Address::TYPE_ACCOUNT, accountId: $accountId);
-        $scoNonceKeyVal = XdrSCVal::forNonceKeyWithAddress($address->toXdr());
-        $ledgerKey->contractDataKey = $scoNonceKeyVal;
-        $response = $this->getLedgerEntry($ledgerKey->toBase64Xdr());
-        if ($response->error == null) {
-            $entryDataXdr = $response->getLedgerEntryDataXdr();
-            if ($entryDataXdr != null) {
-                $contractDataEntry = $entryDataXdr->getContractData();
-                if ($contractDataEntry != null) {
-                    $nonce = $contractDataEntry->val->u64;
-                    if ($nonce !== null) {
-                        return $nonce;
-                    }
-                }
+        $ledgerKey->contractData = new XdrLedgerKeyContractData(
+            Address::fromContractId($contractId)->toXdr(),
+            XdrSCVal::forLedgerKeyContractInstance(),
+            XdrContractDataDurability::PERSISTENT(),
+            XdrContractEntryBodyType::DATA_ENTRY());
+
+        $ledgerEntry = $this->getLedgerEntry($ledgerKey->toBase64Xdr());
+        if ($ledgerEntry != null && $ledgerEntry->ledgerEntryData != null) {
+            $ledgerEntryData = XdrLedgerEntryData::fromBase64Xdr($ledgerEntry->ledgerEntryData);
+            if ($ledgerEntryData->contractData != null && $ledgerEntryData->contractData->body->data?->val->instance?->executable->wasmIdHex != null) {
+                $wasmId = $ledgerEntryData->contractData->body->data->val->instance->executable->wasmIdHex;
+                return $this->loadContractCodeForWasmId($wasmId);
             }
         }
-        return 0;
+        return null;
     }
 
     /**
@@ -263,7 +268,6 @@ class SorobanServer
         $rpcResponse = match ($requestType) {
             self::GET_HEALTH => GetHealthResponse::fromJson($jsonData),
             self::GET_NETWORK => GetNetworkResponse::fromJson($jsonData),
-            self::GET_ACCOUNT => GetAccountResponse::fromJson($jsonData),
             self::SIMULATE_TRANSACTION => SimulateTransactionResponse::fromJson($jsonData),
             self::SEND_TRANSACTION => SendTransactionResponse::fromJson($jsonData),
             self::GET_TRANSACTION => GetTransactionResponse::fromJson($jsonData),

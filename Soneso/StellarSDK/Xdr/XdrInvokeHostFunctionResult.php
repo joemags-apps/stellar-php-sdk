@@ -10,8 +10,7 @@ class XdrInvokeHostFunctionResult
 {
 
     public XdrInvokeHostFunctionResultCode $type;
-    public ?XdrSCVal $success = null;
-
+    public ?string $success = null; // sha256(XdrInvokeHostFunctionSuccessPreImage)
     /**
      * @param XdrInvokeHostFunctionResultCode $type
      */
@@ -26,10 +25,11 @@ class XdrInvokeHostFunctionResult
 
         switch ($this->type->value) {
             case XdrInvokeHostFunctionResultCode::INVOKE_HOST_FUNCTION_SUCCESS:
-                $bytes .= $this->success->encode();
+                $bytes .= $bytes .= XdrEncoder::opaqueFixed($this->success,32);
                 break;
             case XdrInvokeHostFunctionResultCode::INVOKE_HOST_FUNCTION_MALFORMED:
             case XdrInvokeHostFunctionResultCode::INVOKE_HOST_FUNCTION_TRAPPED:
+            case XdrInvokeHostFunctionResultCode::INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED:
                 break;
         }
         return $bytes;
@@ -39,10 +39,11 @@ class XdrInvokeHostFunctionResult
         $result = new XdrInvokeHostFunctionResult(XdrInvokeHostFunctionResultCode::decode($xdr));
         switch ($result->type->value) {
             case XdrInvokeHostFunctionResultCode::INVOKE_HOST_FUNCTION_SUCCESS:
-                $result->success = XdrSCVal::decode($xdr);
+                $result->success = $xdr->readOpaqueFixed(32);
                 break;
             case XdrInvokeHostFunctionResultCode::INVOKE_HOST_FUNCTION_MALFORMED:
             case XdrInvokeHostFunctionResultCode::INVOKE_HOST_FUNCTION_TRAPPED:
+            case XdrInvokeHostFunctionResultCode::INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED:
                 break;
         }
         return $result;
@@ -65,17 +66,17 @@ class XdrInvokeHostFunctionResult
     }
 
     /**
-     * @return XdrSCVal|null
+     * @return string|null
      */
-    public function getSuccess(): ?XdrSCVal
+    public function getSuccess(): ?string
     {
         return $this->success;
     }
 
     /**
-     * @param XdrSCVal|null $success
+     * @param string|null $success
      */
-    public function setSuccess(?XdrSCVal $success): void
+    public function setSuccess(?string $success): void
     {
         $this->success = $success;
     }

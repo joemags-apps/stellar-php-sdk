@@ -12,43 +12,28 @@ class XdrInt128Parts
     // Both signed and unsigned 128-bit ints
     // are transported in a pair of uint64s
     // to reduce the risk of sign-extension.
-    public int $lo;
     public int $hi;
+    public int $lo;
 
     /**
-     * @param int $lo
      * @param int $hi
+     * @param int $lo
      */
-    public function __construct(int $lo, int $hi)
+    public function __construct(int $hi, int $lo)
     {
-        $this->lo = $lo;
         $this->hi = $hi;
+        $this->lo = $lo;
     }
 
+
     public function encode(): string {
-        $bytes = XdrEncoder::unsignedInteger64($this->lo);
-        $bytes .= XdrEncoder::unsignedInteger64($this->hi);
+        $bytes = XdrEncoder::integer64($this->hi);
+        $bytes .= XdrEncoder::unsignedInteger64($this->lo);
         return $bytes;
     }
 
     public static function decode(XdrBuffer $xdr):  XdrInt128Parts {
-        return new XdrInt128Parts($xdr->readUnsignedInteger64(), $xdr->readUnsignedInteger64());
-    }
-
-    /**
-     * @return int
-     */
-    public function getLo(): int
-    {
-        return $this->lo;
-    }
-
-    /**
-     * @param int $lo
-     */
-    public function setLo(int $lo): void
-    {
-        $this->lo = $lo;
+        return new XdrInt128Parts($xdr->readInteger64(), $xdr->readUnsignedInteger64());
     }
 
     /**
@@ -65,6 +50,22 @@ class XdrInt128Parts
     public function setHi(int $hi): void
     {
         $this->hi = $hi;
+    }
+
+    /**
+     * @return int
+     */
+    public function getLo(): int
+    {
+        return $this->lo;
+    }
+
+    /**
+     * @param int $lo
+     */
+    public function setLo(int $lo): void
+    {
+        $this->lo = $lo;
     }
 
 }

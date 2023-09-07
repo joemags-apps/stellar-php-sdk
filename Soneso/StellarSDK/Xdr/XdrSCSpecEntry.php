@@ -24,7 +24,6 @@ class XdrSCSpecEntry
         $this->type = $type;
     }
 
-
     public function encode(): string {
         $bytes = $this->type->encode();
 
@@ -68,6 +67,16 @@ class XdrSCSpecEntry
                 break;
         }
         return $result;
+    }
+
+    public static function fromBase64Xdr(String $base64Xdr) : XdrSCSpecEntry {
+        $xdr = base64_decode($base64Xdr);
+        $xdrBuffer = new XdrBuffer($xdr);
+        return XdrSCSpecEntry::decode($xdrBuffer);
+    }
+
+    public function toBase64Xdr() : String {
+        return base64_encode($this->encode());
     }
 
     /**

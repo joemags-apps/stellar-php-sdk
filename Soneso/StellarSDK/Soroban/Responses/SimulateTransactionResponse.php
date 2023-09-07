@@ -7,6 +7,8 @@
 namespace Soneso\StellarSDK\Soroban\Responses;
 
 use Soneso\StellarSDK\Soroban\Footprint;
+use Soneso\StellarSDK\Soroban\SorobanAuthorizationEntry;
+use Soneso\StellarSDK\Xdr\XdrSorobanTransactionData;
 
 /**
  * Response that will be received when submitting a trial contract invocation.
@@ -26,6 +28,15 @@ class SimulateTransactionResponse extends SorobanRpcResponse
     /// Information about the fees expected, instructions used, etc.
     public SimulateTransactionCost $cost;
 
+    /// The recommended Soroban Transaction Data to use when submitting the simulated transaction. This data contains the refundable fee and resource usage information such as the ledger footprint and IO access data.
+    public ?XdrSorobanTransactionData $transactionData = null;
+
+    /// Recommended minimum resource fee to add when submitting the transaction. This fee is to be added on top of the Stellar network fee.
+    public ?int $minResourceFee = null;
+
+    /// Array of the events emitted during the contract invocation(s). The events are ordered by their emission time. (an array of serialized base64 strings)
+    public ?array $events = null; //[string xdr XdrDiagnosticEvent]
+
     public static function fromJson(array $json) : SimulateTransactionResponse {
         $result = new SimulateTransactionResponse($json);
         if (isset($json['result'])) {
@@ -44,6 +55,20 @@ class SimulateTransactionResponse extends SorobanRpcResponse
             if (isset($json['result']['latestLedger'])) {
                 $result->latestLedger = $json['result']['latestLedger'];
             }
+            if (isset($json['result']['transactionData']) && trim($json['result']['transactionData']) != "") {
+                $result->transactionData = XdrSorobanTransactionData::fromBase64Xdr($json['result']['transactionData']);
+            }
+
+            if (isset($json['result']['events'])) {
+                $result->events = array();
+                foreach ($json['result']['events'] as $jsonValue) {
+                    array_push($result->events, $jsonValue);
+                }
+            }
+
+            if (isset($json['result']['minResourceFee'])) {
+                $result->minResourceFee = intval($json['result']['minResourceFee']);
+            }
         } else if (isset($json['error'])) {
             $result->error = SorobanRpcErrorResponse::fromJson($json);
         }
@@ -51,25 +76,57 @@ class SimulateTransactionResponse extends SorobanRpcResponse
     }
 
     public function getFootprint() : ?Footprint {
-        $results = $this->results;
-        if ($results!= null && $results->count() == 1) {
-            $result = $results->toArray()[0];
-            if ($result instanceof SimulateTransactionResult) {
-                return $result->footprint;
-            }
+        if ($this->transactionData != null) {
+            $xdrFootprint = $this->transactionData->resources->footprint;
+            return new Footprint($xdrFootprint);
         }
         return null;
     }
 
-    public function getAuth() : ?array {
+
+    public function getSorobanAuth() : ?array {
         $results = $this->results;
-        if ($results!= null && $results->count() == 1) {
-            $result = $results->toArray()[0];
-            if ($result instanceof SimulateTransactionResult) {
-                return $result->auth;
+        if ($results!= null && $results->count() > 0 && $results->toArray()[0]->auth != null) {
+            $result = array();
+            foreach($results->toArray()[0]->auth as $nextAuthXdr) {
+                array_push($result, SorobanAuthorizationEntry::fromBase64Xdr($nextAuthXdr));
             }
+            return $result;
         }
         return null;
+    }
+
+    /**
+     * @return int|null
+     */
+    public function getMinResourceFee(): ?int
+    {
+        return $this->minResourceFee;
+    }
+
+    /**
+     * @param int|null $minResourceFee
+     */
+    public function setMinResourceFee(?int $minResourceFee): void
+    {
+        $this->minResourceFee = $minResourceFee;
+    }
+
+
+    /**
+     * @return XdrSorobanTransactionData|null
+     */
+    public function getTransactionData(): ?XdrSorobanTransactionData
+    {
+        return $this->transactionData;
+    }
+
+    /**
+     * @param XdrSorobanTransactionData|null $transactionData
+     */
+    public function setTransactionData(?XdrSorobanTransactionData $transactionData): void
+    {
+        $this->transactionData = $transactionData;
     }
 
     /**
@@ -135,6 +192,22 @@ class SimulateTransactionResponse extends SorobanRpcResponse
     public function setCost(SimulateTransactionCost $cost): void
     {
         $this->cost = $cost;
+    }
+
+    /**
+     * @return array|null
+     */
+    public function getEvents(): ?array
+    {
+        return $this->events;
+    }
+
+    /**
+     * @param array|null $events
+     */
+    public function setEvents(?array $events): void
+    {
+        $this->events = $events;
     }
 
 }

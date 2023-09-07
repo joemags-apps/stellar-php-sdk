@@ -7,19 +7,14 @@
 
 namespace Soneso\StellarSDK\Responses\Operations;
 
-use Soneso\StellarSDK\Responses\HostFunction\ParameterResponse;
-use Soneso\StellarSDK\Responses\HostFunction\ParametersResponse;
 
 class InvokeHostFunctionOperationResponse extends OperationResponse
 {
-    private string $function;
-    private string $footprint;
-    private ?ParametersResponse $parameters;
+    public string $function;
+    public ?ParametersResponse $parameters = null;
 
     protected function loadFromJson(array $json) : void {
-
         $this->function = $json['function'];
-        $this->footprint = $json['footprint'];
         if (isset($json['parameters'])) {
             $this->parameters = new ParametersResponse();
             foreach ($json['parameters'] as $jsonValue) {
@@ -27,6 +22,7 @@ class InvokeHostFunctionOperationResponse extends OperationResponse
                 $this->parameters->add($value);
             }
         }
+        parent::loadFromJson($json);
     }
 
     public static function fromJson(array $jsonData) : InvokeHostFunctionOperationResponse {
@@ -52,22 +48,6 @@ class InvokeHostFunctionOperationResponse extends OperationResponse
     }
 
     /**
-     * @return string
-     */
-    public function getFootprint(): string
-    {
-        return $this->footprint;
-    }
-
-    /**
-     * @param string $footprint
-     */
-    public function setFootprint(string $footprint): void
-    {
-        $this->footprint = $footprint;
-    }
-
-    /**
      * @return ParametersResponse|null
      */
     public function getParameters(): ?ParametersResponse
@@ -82,4 +62,5 @@ class InvokeHostFunctionOperationResponse extends OperationResponse
     {
         $this->parameters = $parameters;
     }
+
 }
